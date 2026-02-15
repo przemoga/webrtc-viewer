@@ -1,7 +1,9 @@
 import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+
 import 'style.dart';
 
 void main() {
@@ -49,6 +51,12 @@ class _ViewerPageState extends State<ViewerPage> {
 
   String _status = "Idle";
   bool _connected = false;
+  bool _connecting = false;
+
+  // Robustness for late-join buffering / duplicate offers / early candidates
+  bool _remoteDescriptionSet = false;
+  final List<RTCIceCandidate> _pendingCandidates = [];
+  String? _lastOfferSdp; // to ignore duplicate offer replay
 
   @override
   void initState() {
@@ -66,25 +74,120 @@ class _ViewerPageState extends State<ViewerPage> {
     }
   }
 
-  Future<void> _connectViewer() async {
+  Future<void> _onMainButtonPressed() async {
+    if (_connected) {
+      await _disconnect(statusAfter: "Disconnected");
+      return;
+    }
+
+    if (_connecting) {
+      await _disconnect(statusAfter: "Cancelled");
+      return;
+    }
+
+    // Not connected, not connecting => start flow
     final roomId = _roomController.text.trim();
     if (roomId.isEmpty) {
       setState(() => _status = "Please enter a Room ID");
       return;
     }
 
-    if (_connected) {
-      await _disconnect();
+    final password = await _askPasswordModal();
+    if (password == null) {
+      // user pressed Cancel in modal => do nothing, back to normal view
+      return;
+    }
+
+    await _connectViewer(password: password);
+  }
+
+  Future<String?> _askPasswordModal() async {
+    final TextEditingController pwCtrl = TextEditingController();
+
+    return showDialog<String?>(
+      context: context,
+      barrierDismissible: false, // force user to choose Connect/Cancel
+      builder: (context) {
+        bool showPw = false;
+
+        return StatefulBuilder(
+          builder: (context, setStateDialog) {
+            return AlertDialog(
+              backgroundColor: AppStyles.surfaceColor,
+              title: Text(
+                "Room password",
+                style: AppStyles.subTitleLine.copyWith(color: AppStyles.whiteColor),
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    "If the room is public, leave it empty.",
+                    style: AppStyles.captionLine.copyWith(
+                      color: AppStyles.whiteColor.withValues(alpha: 0.7),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: pwCtrl,
+                    autofocus: true,
+                    obscureText: !showPw,
+                    style: const TextStyle(color: AppStyles.whiteColor),
+                    decoration: InputDecoration(
+                      labelText: "Password",
+                      prefixIcon: const Icon(Icons.lock),
+                      suffixIcon: IconButton(
+                        icon: Icon(showPw ? Icons.visibility_off : Icons.visibility),
+                        onPressed: () {},
+                      ),
+                    ),
+                    onSubmitted: (_) => Navigator.of(context).pop(pwCtrl.text.trim()),
+                  ),
+                ],
+              ),
+              actions: [
+                // Cancel button EXACTLY same style as Connect
+                ElevatedButton(
+                  onPressed: () => Navigator.of(context).pop(null),
+                  style: AppStyles.primaryButtonStyle(AppStyles.themeColor),
+                  child: Text("Cancel", style: AppStyles.buttonTextStyle),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.of(context).pop(pwCtrl.text.trim()),
+                  style: AppStyles.primaryButtonStyle(AppStyles.themeColor),
+                  child: Text("Connect", style: AppStyles.buttonTextStyle),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _connectViewer({required String password}) async {
+    final roomId = _roomController.text.trim();
+    if (roomId.isEmpty) {
+      setState(() => _status = "Please enter a Room ID");
+      return;
     }
 
     setState(() {
       _status = "Connecting WebSocket...";
       _connected = false;
+      _connecting = true;
     });
 
+    // Reset WebRTC state flags for a fresh connection attempt
+    _remoteDescriptionSet = false;
+    _pendingCandidates.clear();
+    _lastOfferSdp = null;
+
     try {
-      // 1) Connect to signaling websocket
-      final wsUrl = Uri.parse("$signalBase/ws?roomId=$roomId&role=viewer");
+      final pwEnc = Uri.encodeQueryComponent(password);
+
+      // 1) Connect to signaling websocket (pw can be empty)
+      final wsUrl = Uri.parse("$signalBase/ws?roomId=$roomId&role=viewer&pw=$pwEnc");
       _ws = WebSocketChannel.connect(wsUrl);
 
       // 2) Create RTCPeerConnection
@@ -99,7 +202,7 @@ class _ViewerPageState extends State<ViewerPage> {
       _pc!.onTrack = (RTCTrackEvent event) {
         if (event.track.kind == 'video' && event.streams.isNotEmpty) {
           _renderer.srcObject = event.streams[0];
-          setState(() => _status = "Receiving video ✅");
+          if (mounted) setState(() => _status = "Receiving video ✅");
         }
       };
 
@@ -115,10 +218,37 @@ class _ViewerPageState extends State<ViewerPage> {
           final type = msg["type"] as String?;
 
           if (type == "offer") {
+            final offer = msg["data"];
+            final offerSdp = offer["sdp"] as String?;
+
+            // Ignore duplicate offers (can happen when server replays lastOffer, or reconnect races)
+            if (offerSdp != null && offerSdp == _lastOfferSdp) {
+              return;
+            }
+            _lastOfferSdp = offerSdp;
+
+            if (!mounted) return;
             setState(() => _status = "Got offer, creating answer...");
 
-            final offer = msg["data"];
+            // Set remote description
             await _pc!.setRemoteDescription(RTCSessionDescription(offer["sdp"], offer["type"]));
+            _remoteDescriptionSet = true;
+
+            // Apply candidates that arrived early
+            if (_pendingCandidates.isNotEmpty) {
+              for (final c in List<RTCIceCandidate>.from(_pendingCandidates)) {
+                try {
+                  await _pc!.addCandidate(c);
+                } catch (_) {}
+              }
+              _pendingCandidates.clear();
+            }
+
+            // Guard: only answer if state is correct, otherwise ignore
+            final s = _pc!.signalingState;
+            if (s != RTCSignalingState.RTCSignalingStateHaveRemoteOffer) {
+              return; // prevents "Called in wrong state: stable"
+            }
 
             final answer = await _pc!.createAnswer({});
             await _pc!.setLocalDescription(answer);
@@ -128,37 +258,45 @@ class _ViewerPageState extends State<ViewerPage> {
               "data": {"type": answer.type, "sdp": answer.sdp},
             });
 
-            setState(() {
-              _status = "Answer sent, waiting for media...";
-              _connected = true;
-            });
+            if (mounted) {
+              setState(() {
+                _status = "Answer sent, waiting for media...";
+                _connected = true;
+                _connecting = false;
+              });
+            }
           } else if (type == "candidate") {
             final c = msg["data"];
-            try {
-              await _pc!.addCandidate(
-                RTCIceCandidate(c["candidate"], c["sdpMid"], c["sdpMLineIndex"]),
-              );
-            } catch (_) {
-              // Sometimes candidates arrive early; ignore minor timing issues in MVP
+            final ice = RTCIceCandidate(c["candidate"], c["sdpMid"], c["sdpMLineIndex"]);
+
+            // If remote description not set yet, store for later
+            if (!_remoteDescriptionSet) {
+              _pendingCandidates.add(ice);
+              return;
             }
+
+            try {
+              await _pc!.addCandidate(ice);
+            } catch (_) {}
           }
         },
-        onError: (e) {
-          setState(() => _status = "WebSocket error: $e");
-          _disconnect();
+        onError: (e) async {
+          if (!mounted) return;
+          // Typical cases:
+          // - wrong password => WS upgrade fails
+          // - room not found => 404
+          await _disconnect(statusAfter: "Connection error (wrong password or room not found)");
         },
-        onDone: () {
-          if (_connected) {
-            setState(() => _status = "WebSocket closed");
-            _disconnect();
-          }
+        onDone: () async {
+          if (!mounted) return;
+          await _disconnect(statusAfter: _connected ? "Disconnected" : "Disconnected");
         },
       );
 
-      setState(() => _status = "Waiting for host offer...");
+      if (mounted) setState(() => _status = "Waiting for host offer...");
     } catch (e) {
-      setState(() => _status = "Connection failed: $e");
-      _disconnect();
+      if (!mounted) return;
+      await _disconnect(statusAfter: "Connection failed: $e");
     }
   }
 
@@ -168,36 +306,39 @@ class _ViewerPageState extends State<ViewerPage> {
     ws.sink.add(jsonEncode(msg));
   }
 
-  Future<void> _disconnect() async {
-    // avoid recursive disconnect if called from onDone/onError
-    if (!_connected && _ws == null) return;
-
-    setState(() => _status = "Disconnecting...");
-
+  Future<void> _disconnect({required String statusAfter}) async {
+    // Close everything and reset UI
     try {
       await _pc?.close();
-      _pc = null;
+    } catch (_) {}
+    _pc = null;
 
+    try {
       await _renderer.srcObject?.dispose();
-      _renderer.srcObject = null; // Prepare for next connection
+    } catch (_) {}
+    _renderer.srcObject = null;
 
+    try {
       await _ws?.sink.close();
-      _ws = null;
-    } catch (e) {
-      print("Error disconnecting: $e");
-    }
+    } catch (_) {}
+    _ws = null;
+
+    _remoteDescriptionSet = false;
+    _pendingCandidates.clear();
+    _lastOfferSdp = null;
 
     if (mounted) {
       setState(() {
-        _status = "Disconnected";
         _connected = false;
+        _connecting = false;
+        _status = statusAfter;
       });
     }
   }
 
   @override
   void dispose() {
-    _disconnect();
+    _disconnect(statusAfter: "Disposed");
     _renderer.dispose();
     _roomController.dispose();
     super.dispose();
@@ -205,6 +346,8 @@ class _ViewerPageState extends State<ViewerPage> {
 
   @override
   Widget build(BuildContext context) {
+    final String buttonLabel = _connected ? "Disconnect" : (_connecting ? "Cancel" : "Connect");
+
     return Scaffold(
       backgroundColor: AppStyles.blackColor,
       body: SafeArea(
@@ -251,13 +394,14 @@ class _ViewerPageState extends State<ViewerPage> {
               ),
               const SizedBox(height: 24),
 
-              // Controls Section - Always in a Row
+              // Controls Section
               Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Expanded(
                     child: TextField(
                       controller: _roomController,
+                      enabled: !_connecting && !_connected,
                       style: const TextStyle(color: AppStyles.whiteColor),
                       decoration: AppStyles.textFieldDecoration(
                         "Room ID",
@@ -267,12 +411,9 @@ class _ViewerPageState extends State<ViewerPage> {
                   ),
                   const SizedBox(width: 16),
                   ElevatedButton(
-                    onPressed: _connectViewer,
+                    onPressed: _onMainButtonPressed,
                     style: AppStyles.primaryButtonStyle(AppStyles.themeColor),
-                    child: Text(
-                      _connected ? "Reconnect" : "Connect",
-                      style: AppStyles.buttonTextStyle,
-                    ),
+                    child: Text(buttonLabel, style: AppStyles.buttonTextStyle),
                   ),
                 ],
               ),
