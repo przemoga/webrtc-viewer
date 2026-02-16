@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -50,13 +51,19 @@ class _ViewerPageState extends State<ViewerPage> {
   RTCPeerConnection? _pc;
 
   String _status = "Idle";
-  bool _connected = false;
-  bool _connecting = false;
+  bool _connected = false; // true after answer sent
+  bool _connecting = false; // true while we are trying to connect
 
   // Robustness for late-join buffering / duplicate offers / early candidates
   bool _remoteDescriptionSet = false;
   final List<RTCIceCandidate> _pendingCandidates = [];
   String? _lastOfferSdp; // to ignore duplicate offer replay
+
+  // Track one connection attempt so late callbacks can't break a new attempt
+  int _attemptId = 0;
+
+  // Keep the last password so user can reconnect quickly (optional)
+  String _lastPassword = "";
 
   @override
   void initState() {
@@ -75,34 +82,37 @@ class _ViewerPageState extends State<ViewerPage> {
   }
 
   Future<void> _onMainButtonPressed() async {
+    // If connected -> Disconnect
     if (_connected) {
       await _disconnect(statusAfter: "Disconnected");
       return;
     }
 
+    // If connecting -> Cancel
     if (_connecting) {
       await _disconnect(statusAfter: "Cancelled");
       return;
     }
 
-    // Not connected, not connecting => start flow
+    // Start connect flow
     final roomId = _roomController.text.trim();
     if (roomId.isEmpty) {
       setState(() => _status = "Please enter a Room ID");
       return;
     }
 
-    final password = await _askPasswordModal();
+    final password = await _askPasswordModal(initialValue: _lastPassword);
     if (password == null) {
       // user pressed Cancel in modal => do nothing, back to normal view
       return;
     }
 
+    _lastPassword = password;
     await _connectViewer(password: password);
   }
 
-  Future<String?> _askPasswordModal() async {
-    final TextEditingController pwCtrl = TextEditingController();
+  Future<String?> _askPasswordModal({required String initialValue}) async {
+    final TextEditingController pwCtrl = TextEditingController(text: initialValue);
 
     return showDialog<String?>(
       context: context,
@@ -134,11 +144,11 @@ class _ViewerPageState extends State<ViewerPage> {
                     obscureText: !showPw,
                     style: const TextStyle(color: AppStyles.whiteColor),
                     decoration: InputDecoration(
-                      labelText: "Password",
+                      labelText: "Password (optional)",
                       prefixIcon: const Icon(Icons.lock),
                       suffixIcon: IconButton(
                         icon: Icon(showPw ? Icons.visibility_off : Icons.visibility),
-                        onPressed: () {},
+                        onPressed: () => setStateDialog(() => showPw = !showPw),
                       ),
                     ),
                     onSubmitted: (_) => Navigator.of(context).pop(pwCtrl.text.trim()),
@@ -165,6 +175,33 @@ class _ViewerPageState extends State<ViewerPage> {
     );
   }
 
+  /// Hard reset to ensure 2nd/3rd connect works reliably.
+  /// This prevents reusing half-closed WS/PC state.
+  Future<void> _resetSession() async {
+    // Close WS first to stop incoming messages
+    try {
+      await _ws?.sink.close();
+    } catch (_) {}
+    _ws = null;
+
+    // Close PC
+    try {
+      await _pc?.close();
+    } catch (_) {}
+    _pc = null;
+
+    // Clear renderer stream
+    try {
+      await _renderer.srcObject?.dispose();
+    } catch (_) {}
+    _renderer.srcObject = null;
+
+    // Reset flags
+    _remoteDescriptionSet = false;
+    _pendingCandidates.clear();
+    _lastOfferSdp = null;
+  }
+
   Future<void> _connectViewer({required String password}) async {
     final roomId = _roomController.text.trim();
     if (roomId.isEmpty) {
@@ -172,16 +209,18 @@ class _ViewerPageState extends State<ViewerPage> {
       return;
     }
 
+    // Start a new attempt id; old callbacks will be ignored
+    final int myAttempt = ++_attemptId;
+
+    // Ensure clean state before starting (THIS is the key for reconnects)
+    await _resetSession();
+
+    if (!mounted) return;
     setState(() {
       _status = "Connecting WebSocket...";
       _connected = false;
       _connecting = true;
     });
-
-    // Reset WebRTC state flags for a fresh connection attempt
-    _remoteDescriptionSet = false;
-    _pendingCandidates.clear();
-    _lastOfferSdp = null;
 
     try {
       final pwEnc = Uri.encodeQueryComponent(password);
@@ -189,7 +228,7 @@ class _ViewerPageState extends State<ViewerPage> {
       // 1) Connect to signaling websocket (pw can be empty)
       final wsUrl = Uri.parse("$signalBase/ws?roomId=$roomId&role=viewer&pw=$pwEnc");
       _ws = WebSocketChannel.connect(wsUrl);
-
+      _send({"type": "viewer-ready"});
       // 2) Create RTCPeerConnection
       _pc = await createPeerConnection({
         "iceServers": [
@@ -200,6 +239,7 @@ class _ViewerPageState extends State<ViewerPage> {
 
       // Receive remote tracks
       _pc!.onTrack = (RTCTrackEvent event) {
+        if (myAttempt != _attemptId) return;
         if (event.track.kind == 'video' && event.streams.isNotEmpty) {
           _renderer.srcObject = event.streams[0];
           if (mounted) setState(() => _status = "Receiving video ✅");
@@ -208,12 +248,15 @@ class _ViewerPageState extends State<ViewerPage> {
 
       // Send ICE candidates to host
       _pc!.onIceCandidate = (RTCIceCandidate candidate) {
+        if (myAttempt != _attemptId) return;
         _send({"type": "candidate", "data": candidate.toMap()});
       };
 
       // Listen for signaling messages
       _ws!.stream.listen(
         (message) async {
+          if (myAttempt != _attemptId) return;
+
           final Map<String, dynamic> msg = jsonDecode(message as String);
           final type = msg["type"] as String?;
 
@@ -221,7 +264,7 @@ class _ViewerPageState extends State<ViewerPage> {
             final offer = msg["data"];
             final offerSdp = offer["sdp"] as String?;
 
-            // Ignore duplicate offers (can happen when server replays lastOffer, or reconnect races)
+            // Ignore duplicate offers (server may replay lastOffer)
             if (offerSdp != null && offerSdp == _lastOfferSdp) {
               return;
             }
@@ -244,10 +287,11 @@ class _ViewerPageState extends State<ViewerPage> {
               _pendingCandidates.clear();
             }
 
-            // Guard: only answer if state is correct, otherwise ignore
+            // Guard: only answer if state is correct
             final s = _pc!.signalingState;
             if (s != RTCSignalingState.RTCSignalingStateHaveRemoteOffer) {
-              return; // prevents "Called in wrong state: stable"
+              // already answered or wrong state
+              return;
             }
 
             final answer = await _pc!.createAnswer({});
@@ -258,7 +302,7 @@ class _ViewerPageState extends State<ViewerPage> {
               "data": {"type": answer.type, "sdp": answer.sdp},
             });
 
-            if (mounted) {
+            if (mounted && myAttempt == _attemptId) {
               setState(() {
                 _status = "Answer sent, waiting for media...";
                 _connected = true;
@@ -281,6 +325,7 @@ class _ViewerPageState extends State<ViewerPage> {
           }
         },
         onError: (e) async {
+          if (myAttempt != _attemptId) return;
           if (!mounted) return;
           // Typical cases:
           // - wrong password => WS upgrade fails
@@ -288,13 +333,17 @@ class _ViewerPageState extends State<ViewerPage> {
           await _disconnect(statusAfter: "Connection error (wrong password or room not found)");
         },
         onDone: () async {
+          if (myAttempt != _attemptId) return;
           if (!mounted) return;
-          await _disconnect(statusAfter: _connected ? "Disconnected" : "Disconnected");
+          await _disconnect(statusAfter: "Disconnected");
         },
       );
 
-      if (mounted) setState(() => _status = "Waiting for host offer...");
+      if (mounted && myAttempt == _attemptId) {
+        setState(() => _status = "Waiting for host offer...");
+      }
     } catch (e) {
+      if (myAttempt != _attemptId) return;
       if (!mounted) return;
       await _disconnect(statusAfter: "Connection failed: $e");
     }
@@ -307,25 +356,10 @@ class _ViewerPageState extends State<ViewerPage> {
   }
 
   Future<void> _disconnect({required String statusAfter}) async {
-    // Close everything and reset UI
-    try {
-      await _pc?.close();
-    } catch (_) {}
-    _pc = null;
+    // Invalidate current attempt so late callbacks do nothing
+    _attemptId++;
 
-    try {
-      await _renderer.srcObject?.dispose();
-    } catch (_) {}
-    _renderer.srcObject = null;
-
-    try {
-      await _ws?.sink.close();
-    } catch (_) {}
-    _ws = null;
-
-    _remoteDescriptionSet = false;
-    _pendingCandidates.clear();
-    _lastOfferSdp = null;
+    await _resetSession();
 
     if (mounted) {
       setState(() {
