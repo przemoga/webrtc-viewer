@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -41,7 +42,6 @@ class ViewerPage extends StatefulWidget {
 }
 
 class _ViewerPageState extends State<ViewerPage> {
-  // Your Cloud Run service base (no trailing slash)
   static const String signalBase = "wss://przemoga-135868799691.us-central1.run.app";
 
   final RTCVideoRenderer _renderer = RTCVideoRenderer();
@@ -51,18 +51,16 @@ class _ViewerPageState extends State<ViewerPage> {
   RTCPeerConnection? _pc;
 
   String _status = "Idle";
-  bool _connected = false; // true after answer sent
-  bool _connecting = false; // true while we are trying to connect
+  bool _connected = false;
+  bool _connecting = false;
 
-  // Robustness for late-join buffering / duplicate offers / early candidates
+  // Session + safety
+  String? _sessionId;
   bool _remoteDescriptionSet = false;
   final List<RTCIceCandidate> _pendingCandidates = [];
-  String? _lastOfferSdp; // to ignore duplicate offer replay
+  String? _lastOfferSdp;
 
-  // Track one connection attempt so late callbacks can't break a new attempt
   int _attemptId = 0;
-
-  // Keep the last password so user can reconnect quickly (optional)
   String _lastPassword = "";
 
   @override
@@ -74,27 +72,29 @@ class _ViewerPageState extends State<ViewerPage> {
   Future<void> _init() async {
     await _renderer.initialize();
 
-    final uri = Uri.base; // e.g. https://host/?room=abc
+    final uri = Uri.base;
     final room = uri.queryParameters['room'];
     if (room != null && room.isNotEmpty) {
       _roomController.text = room;
     }
   }
 
+  String _newSessionId() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    final r = Random.secure();
+    return List.generate(10, (_) => chars[r.nextInt(chars.length)]).join();
+  }
+
   Future<void> _onMainButtonPressed() async {
-    // If connected -> Disconnect
     if (_connected) {
       await _disconnect(statusAfter: "Disconnected");
       return;
     }
-
-    // If connecting -> Cancel
     if (_connecting) {
       await _disconnect(statusAfter: "Cancelled");
       return;
     }
 
-    // Start connect flow
     final roomId = _roomController.text.trim();
     if (roomId.isEmpty) {
       setState(() => _status = "Please enter a Room ID");
@@ -102,10 +102,7 @@ class _ViewerPageState extends State<ViewerPage> {
     }
 
     final password = await _askPasswordModal(initialValue: _lastPassword);
-    if (password == null) {
-      // user pressed Cancel in modal => do nothing, back to normal view
-      return;
-    }
+    if (password == null) return;
 
     _lastPassword = password;
     await _connectViewer(password: password);
@@ -116,7 +113,7 @@ class _ViewerPageState extends State<ViewerPage> {
 
     return showDialog<String?>(
       context: context,
-      barrierDismissible: false, // force user to choose Connect/Cancel
+      barrierDismissible: false,
       builder: (context) {
         bool showPw = false;
 
@@ -156,7 +153,6 @@ class _ViewerPageState extends State<ViewerPage> {
                 ],
               ),
               actions: [
-                // Cancel button EXACTLY same style as Connect
                 ElevatedButton(
                   onPressed: () => Navigator.of(context).pop(null),
                   style: AppStyles.primaryButtonStyle(AppStyles.themeColor),
@@ -175,31 +171,32 @@ class _ViewerPageState extends State<ViewerPage> {
     );
   }
 
-  /// Hard reset to ensure 2nd/3rd connect works reliably.
-  /// This prevents reusing half-closed WS/PC state.
   Future<void> _resetSession() async {
-    // Close WS first to stop incoming messages
     try {
       await _ws?.sink.close();
     } catch (_) {}
     _ws = null;
 
-    // Close PC
     try {
       await _pc?.close();
     } catch (_) {}
     _pc = null;
 
-    // Clear renderer stream
     try {
       await _renderer.srcObject?.dispose();
     } catch (_) {}
     _renderer.srcObject = null;
 
-    // Reset flags
     _remoteDescriptionSet = false;
     _pendingCandidates.clear();
     _lastOfferSdp = null;
+    _sessionId = null;
+  }
+
+  void _send(Map<String, dynamic> msg) {
+    final ws = _ws;
+    if (ws == null) return;
+    ws.sink.add(jsonEncode(msg));
   }
 
   Future<void> _connectViewer({required String password}) async {
@@ -209,10 +206,8 @@ class _ViewerPageState extends State<ViewerPage> {
       return;
     }
 
-    // Start a new attempt id; old callbacks will be ignored
     final int myAttempt = ++_attemptId;
 
-    // Ensure clean state before starting (THIS is the key for reconnects)
     await _resetSession();
 
     if (!mounted) return;
@@ -225,11 +220,13 @@ class _ViewerPageState extends State<ViewerPage> {
     try {
       final pwEnc = Uri.encodeQueryComponent(password);
 
-      // 1) Connect to signaling websocket (pw can be empty)
       final wsUrl = Uri.parse("$signalBase/ws?roomId=$roomId&role=viewer&pw=$pwEnc");
       _ws = WebSocketChannel.connect(wsUrl);
-      _send({"type": "viewer-ready"});
-      // 2) Create RTCPeerConnection
+
+      // Create new sessionId for this attempt and tell host
+      _sessionId = _newSessionId();
+      _send({"type": "viewer-ready", "sessionId": _sessionId});
+
       _pc = await createPeerConnection({
         "iceServers": [
           {"urls": "stun:stun.l.google.com:19302"},
@@ -237,7 +234,6 @@ class _ViewerPageState extends State<ViewerPage> {
         "sdpSemantics": "unified-plan",
       });
 
-      // Receive remote tracks
       _pc!.onTrack = (RTCTrackEvent event) {
         if (myAttempt != _attemptId) return;
         if (event.track.kind == 'video' && event.streams.isNotEmpty) {
@@ -246,38 +242,39 @@ class _ViewerPageState extends State<ViewerPage> {
         }
       };
 
-      // Send ICE candidates to host
       _pc!.onIceCandidate = (RTCIceCandidate candidate) {
         if (myAttempt != _attemptId) return;
-        _send({"type": "candidate", "data": candidate.toMap()});
+        _send({"type": "candidate", "sessionId": _sessionId, "data": candidate.toMap()});
       };
 
-      // Listen for signaling messages
       _ws!.stream.listen(
         (message) async {
           if (myAttempt != _attemptId) return;
 
           final Map<String, dynamic> msg = jsonDecode(message as String);
           final type = msg["type"] as String?;
+          final sid = msg["sessionId"] as String?;
+
+          // Ignore stale signaling from previous sessions
+          if (_sessionId != null && sid != null && sid != _sessionId) {
+            return;
+          }
 
           if (type == "offer") {
             final offer = msg["data"];
             final offerSdp = offer["sdp"] as String?;
 
-            // Ignore duplicate offers (server may replay lastOffer)
-            if (offerSdp != null && offerSdp == _lastOfferSdp) {
-              return;
-            }
+            // Ignore duplicate offers within same session
+            if (offerSdp != null && offerSdp == _lastOfferSdp) return;
             _lastOfferSdp = offerSdp;
 
             if (!mounted) return;
             setState(() => _status = "Got offer, creating answer...");
 
-            // Set remote description
             await _pc!.setRemoteDescription(RTCSessionDescription(offer["sdp"], offer["type"]));
             _remoteDescriptionSet = true;
 
-            // Apply candidates that arrived early
+            // Apply queued ICE
             if (_pendingCandidates.isNotEmpty) {
               for (final c in List<RTCIceCandidate>.from(_pendingCandidates)) {
                 try {
@@ -287,18 +284,15 @@ class _ViewerPageState extends State<ViewerPage> {
               _pendingCandidates.clear();
             }
 
-            // Guard: only answer if state is correct
             final s = _pc!.signalingState;
-            if (s != RTCSignalingState.RTCSignalingStateHaveRemoteOffer) {
-              // already answered or wrong state
-              return;
-            }
+            if (s != RTCSignalingState.RTCSignalingStateHaveRemoteOffer) return;
 
             final answer = await _pc!.createAnswer({});
             await _pc!.setLocalDescription(answer);
 
             _send({
               "type": "answer",
+              "sessionId": _sessionId,
               "data": {"type": answer.type, "sdp": answer.sdp},
             });
 
@@ -313,12 +307,10 @@ class _ViewerPageState extends State<ViewerPage> {
             final c = msg["data"];
             final ice = RTCIceCandidate(c["candidate"], c["sdpMid"], c["sdpMLineIndex"]);
 
-            // If remote description not set yet, store for later
             if (!_remoteDescriptionSet) {
               _pendingCandidates.add(ice);
               return;
             }
-
             try {
               await _pc!.addCandidate(ice);
             } catch (_) {}
@@ -327,9 +319,6 @@ class _ViewerPageState extends State<ViewerPage> {
         onError: (e) async {
           if (myAttempt != _attemptId) return;
           if (!mounted) return;
-          // Typical cases:
-          // - wrong password => WS upgrade fails
-          // - room not found => 404
           await _disconnect(statusAfter: "Connection error (wrong password or room not found)");
         },
         onDone: () async {
@@ -349,18 +338,9 @@ class _ViewerPageState extends State<ViewerPage> {
     }
   }
 
-  void _send(Map<String, dynamic> msg) {
-    final ws = _ws;
-    if (ws == null) return;
-    ws.sink.add(jsonEncode(msg));
-  }
-
   Future<void> _disconnect({required String statusAfter}) async {
-    // Invalidate current attempt so late callbacks do nothing
     _attemptId++;
-
     await _resetSession();
-
     if (mounted) {
       setState(() {
         _connected = false;
@@ -390,14 +370,12 @@ class _ViewerPageState extends State<ViewerPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Header
               Text("XSPECTION", style: AppStyles.titleLine),
               const SizedBox(height: 8),
               Row(
                 children: [
                   Text("CCTV Remote Viewer", style: AppStyles.subTitleLine),
                   const Spacer(),
-                  // Discrete Status Indicator
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                     decoration: BoxDecoration(
@@ -418,7 +396,6 @@ class _ViewerPageState extends State<ViewerPage> {
                           _status,
                           style: AppStyles.captionLine.copyWith(
                             color: AppStyles.whiteColor.withValues(alpha: 0.7),
-                            fontStyle: FontStyle.normal,
                           ),
                         ),
                       ],
@@ -428,7 +405,6 @@ class _ViewerPageState extends State<ViewerPage> {
               ),
               const SizedBox(height: 24),
 
-              // Controls Section
               Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -454,7 +430,6 @@ class _ViewerPageState extends State<ViewerPage> {
 
               const SizedBox(height: 24),
 
-              // Video Section
               Expanded(
                 child: Container(
                   width: double.infinity,
@@ -463,7 +438,6 @@ class _ViewerPageState extends State<ViewerPage> {
                     borderRadius: BorderRadius.circular(10),
                     child: Stack(
                       children: [
-                        // The Video
                         RTCVideoView(
                           _renderer,
                           mirror: false,
@@ -488,8 +462,6 @@ class _ViewerPageState extends State<ViewerPage> {
                             ),
                           ),
                         ),
-
-                        // Overlay status badge if connected
                         if (_connected)
                           Positioned(
                             top: 16,
