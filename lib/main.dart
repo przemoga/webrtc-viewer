@@ -7,6 +7,9 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'style.dart';
+import 'dart:convert';
+import 'dart:math';
+import 'package:crypto/crypto.dart';
 
 void main() {
   runApp(const MyApp());
@@ -62,6 +65,8 @@ class _ViewerPageState extends State<ViewerPage> {
 
   int _attemptId = 0;
   String _lastPassword = "";
+
+  static const String hmacSecret = "G7kP2xQ9mL4z";
 
   @override
   void initState() {
@@ -171,6 +176,7 @@ class _ViewerPageState extends State<ViewerPage> {
     );
   }
 
+  //  HMAC_SECRET:G7kP2xQ9mL4z
   Future<void> _resetSession() async {
     try {
       await _ws?.sink.close();
@@ -220,7 +226,17 @@ class _ViewerPageState extends State<ViewerPage> {
     try {
       final pwEnc = Uri.encodeQueryComponent(password);
 
-      final wsUrl = Uri.parse("$signalBase/ws?roomId=$roomId&role=viewer&pw=$pwEnc");
+      final viewerWsSessionId = _newSessionId(); // for WS auth (not the same as WebRTC session)
+      final hmac = buildHmacParams(roomId: roomId, role: "viewer", sessionId: viewerWsSessionId);
+
+      final wsUrl = Uri.parse(
+        "$signalBase/ws?roomId=$roomId&role=viewer&pw=$pwEnc"
+        "&sessionId=${Uri.encodeQueryComponent(hmac['sessionId']!)}"
+        "&ts=${hmac['ts']}"
+        "&nonce=${Uri.encodeQueryComponent(hmac['nonce']!)}"
+        "&sig=${hmac['sig']}",
+      );
+
       _ws = WebSocketChannel.connect(wsUrl);
 
       // Create new sessionId for this attempt and tell host
@@ -348,6 +364,35 @@ class _ViewerPageState extends State<ViewerPage> {
         _status = statusAfter;
       });
     }
+  }
+
+  String _randNonce([int bytes = 12]) {
+    final r = Random.secure();
+    final b = List<int>.generate(bytes, (_) => r.nextInt(256));
+    // base64url without padding
+    return base64UrlEncode(b).replaceAll('=', '');
+  }
+
+  String _hmacHex(String canonical) {
+    final key = utf8.encode(hmacSecret);
+    final msg = utf8.encode(canonical);
+    final digest = Hmac(sha256, key).convert(msg);
+    return digest.toString(); // hex
+  }
+
+  Map<String, String> buildHmacParams({
+    required String roomId,
+    required String role, // "host" or "viewer"
+    required String sessionId,
+  }) {
+    final ts = (DateTime.now().millisecondsSinceEpoch ~/ 1000).toString();
+    final nonce = _randNonce();
+
+    // MUST match Go canonical exactly:
+    final canonical = "roomId=$roomId&role=$role&sessionId=$sessionId&ts=$ts&nonce=$nonce";
+
+    final sig = _hmacHex(canonical);
+    return {"sessionId": sessionId, "ts": ts, "nonce": nonce, "sig": sig};
   }
 
   @override
